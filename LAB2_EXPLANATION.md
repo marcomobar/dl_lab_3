@@ -79,17 +79,463 @@ class GlobalConfig:
     grad_clip: float = 1.0
 ```
 
-### Explicación de Hiperparámetros
+### Explicación Detallada de Hiperparámetros
 
-| Parámetro | Valor | Justificación |
-|-----------|-------|---------------|
-| `lookback: 336` | 336 timesteps | Contexto histórico amplio para capturar patrones semanales (14 días en ETTh, 3.5 días en ETTm) |
-| `hidden_dim: 256` | 256 | Balance entre capacidad de representación y eficiencia computacional |
-| `num_encoder/decoder_layers: 2` | 2 capas | Profundidad moderada para evitar overfitting en datasets pequeños |
-| `dropout: 0.3` | 30% | Regularización para prevenir overfitting |
-| `batch_size: 128` | 128 | Suficientemente grande para estabilidad de gradientes, pequeño para eficiencia de memoria |
-| `learning_rate: 1e-3` | 0.001 | Tasa estándar para Adam, con cosine decay |
-| `patience: 15` | 15 épocas | Early stopping para prevenir overfitting |
+#### 2.1 Configuración de Datasets
+
+**`datasets: List[str] = ['ETTh1', 'ETTh2', 'ETTm1', 'ETTm2']`**
+
+Lista de datasets ETT (Electricity Transformer Temperature) a evaluar.
+
+- **ETTh1/ETTh2:** Datos horarios (hourly)
+  - Frecuencia: 1 hora
+  - Total timesteps: ~17,420 (≈2 años)
+  - Uso: Evaluación de predicción a largo plazo con granularidad horaria
+
+- **ETTm1/ETTm2:** Datos cada 15 minutos (minute)
+  - Frecuencia: 15 minutos
+  - Total timesteps: ~69,680 (≈2 años)
+  - Uso: Evaluación de predicción con mayor resolución temporal
+
+**Diferencia entre datasets:**
+- ETTh1 vs ETTh2: Diferentes transformadores, patrones de temperatura distintos
+- ETTm1 vs ETTm2: Misma lógica, pero con datos de 15 minutos
+
+**`horizons: List[int] = [24, 48, 96, 192, 336, 720]`**
+
+Horizontes de predicción (número de timesteps futuros a predecir).
+
+**Para datasets ETTh (horarios):**
+- `H=24` → 1 día
+- `H=48` → 2 días
+- `H=96` → 4 días
+- `H=192` → 8 días
+- `H=336` → 14 días (2 semanas)
+- `H=720` → 30 días (1 mes)
+
+**Para datasets ETTm (15 min):**
+- `H=24` → 6 horas
+- `H=48` → 12 horas
+- `H=96` → 24 horas (1 día)
+- `H=192` → 2 días
+- `H=336` → 3.5 días
+- `H=720` → 7.5 días
+
+**Justificación de múltiples horizontes:**
+- Evalúa capacidad del modelo en diferentes escalas temporales
+- Permite análisis de degradación de rendimiento con horizonte más largo
+- Total experimentos: 4 datasets × 6 horizontes = **24 experimentos**
+
+---
+
+#### 2.2 Arquitectura del Modelo TiDE
+
+**`lookback: int = 336`**
+
+**Definición:** Tamaño de la ventana histórica (contexto) que el modelo observa para hacer predicciones.
+
+**Valor:** 336 timesteps
+
+**Interpretación temporal:**
+- **ETTh (horario):** 336 horas = 14 días = 2 semanas
+- **ETTm (15 min):** 336 × 15 min = 5,040 min = 84 horas = 3.5 días
+
+**Justificación:**
+- **Captura de patrones semanales:** Con 14 días (ETTh), el modelo puede aprender ciclos semanales completos (lunes-domingo)
+- **Balanceo computacional:** Ventana suficientemente grande para capturar tendencias sin excesivo costo de memoria
+- **Relación con horizonte:** `lookback >> horizon` para la mayoría de horizontes, dando contexto amplio
+
+**Alternativas consideradas:**
+- `lookback=96` (requerimiento mínimo del paper): Menos contexto, más rápido
+- `lookback=720` (usado en paper para algunos horizontes): Más contexto, mayor costo computacional
+
+**Trade-off:**
+```
+lookback pequeño (96)  → Menos contexto    → Entrenamiento rápido  → Peor rendimiento
+lookback medio (336)   → Contexto adecuado → Balanceado            → Buen rendimiento
+lookback grande (720)  → Más contexto      → Entrenamiento lento   → Mejor rendimiento
+```
+
+---
+
+**`hidden_dim: int = 256`**
+
+**Definición:** Dimensionalidad del espacio latente en el encoder/decoder.
+
+**Valor:** 256
+
+**Rol en arquitectura:**
+- Tamaño de la representación comprimida del encoder
+- Dimensión de los bloques residuales
+- Determina capacidad de representación del modelo
+
+**Impacto en parámetros:**
+```
+hidden_dim=128 → ~2M parámetros   → Modelo compacto  → Menor capacidad
+hidden_dim=256 → ~7.5M parámetros → Balanceado       → Buena capacidad
+hidden_dim=512 → ~30M parámetros  → Modelo grande    → Mayor capacidad
+```
+
+**Justificación:**
+- **Balance capacidad/eficiencia:** Suficiente para aprender patrones complejos sin overfitting
+- **Según paper (Tabla 7):** Rangos recomendados [256, 512, 1024] dependiendo del dataset
+- **Memoria GPU:** Con batch_size=128, hidden_dim=256 cabe cómodamente en GPU moderna
+
+**Relación con otros parámetros:**
+```
+Input: [B, L, D] = [128, 336, 7]
+       ↓ feature_proj
+Latent: [B, hidden_dim] = [128, 256]  ← Compresión: 2352 → 256
+       ↓ decoder_proj
+Output: [B, H] = [128, 96]
+```
+
+---
+
+**`num_encoder_layers: int = 2`**
+
+**Definición:** Número de bloques residuales en el encoder.
+
+**Valor:** 2 capas
+
+**Estructura del encoder:**
+```
+Input [B, 2352]
+    ↓ feature_proj
+[B, 256]
+    ↓ ResidualBlock 1
+[B, 256]
+    ↓ ResidualBlock 2
+[B, 256]
+    ↓ dense_encoder
+Encoded [B, 256]
+```
+
+**Justificación:**
+- **Profundidad moderada:** Evita overfitting en datasets relativamente pequeños (~12k muestras de entrenamiento)
+- **Estabilidad de entrenamiento:** 2 capas permiten convergencia estable sin gradientes explosivos/desvanecidos
+- **Según paper (Tabla 7):** Rango recomendado [1, 2, 3] capas
+
+**Trade-off:**
+```
+num_layers=1 → Menos expresividad → Underfitting potencial   → Entrenamiento rápido
+num_layers=2 → Balance óptimo     → Buen ajuste             → Tiempo moderado
+num_layers=3 → Más expresividad   → Overfitting potencial   → Entrenamiento lento
+```
+
+**Impacto en parámetros:**
+- Por cada capa: ~132k parámetros adicionales
+- 2 capas: ~264k parámetros totales en encoder
+
+---
+
+**`num_decoder_layers: int = 2`**
+
+**Definición:** Número de bloques residuales en el decoder.
+
+**Valor:** 2 capas
+
+**Estructura del decoder:**
+```
+Decoder Input [B, H, 256]
+    ↓ ResidualBlock 1
+[B, H, 256]
+    ↓ ResidualBlock 2
+[B, H, 256]
+    ↓ output_layer
+Output [B, H]
+```
+
+**Justificación:** Misma lógica que `num_encoder_layers`
+- **Simetría con encoder:** Mantiene balance entre capacidad de encoding/decoding
+- **Regularización implícita:** Profundidad moderada reduce overfitting
+- **Según paper:** Encoder y decoder suelen tener igual número de capas
+
+---
+
+**`temporal_width: int = 4`**
+
+**Definición:** Dimensión del embedding temporal en la arquitectura TiDE completa (paper original).
+
+**Valor:** 4
+
+**Nota importante:** En esta implementación simplificada (`TiDENormal`), este parámetro **no se utiliza activamente**.
+
+**En la arquitectura completa del paper:**
+```
+Covariates [B, L+H, num_features]
+    ↓ Feature Projection (per timestep)
+Projected [B, L+H, temporal_width]
+    ↓ Concatenar con lookback + static features
+Encoder Input [B, L*D + (L+H)*temporal_width + static_dim]
+```
+
+**Por qué no está implementado aquí:**
+- Versión simplificada enfocada en univariado (solo predice OT)
+- No se usan covariables externas explícitas
+- Reduce complejidad para fines educativos
+
+**Si se implementara:**
+```python
+self.temporal_proj = nn.Linear(num_features, temporal_width)  # 7 → 4
+```
+
+---
+
+**`dropout: float = 0.3`**
+
+**Definición:** Probabilidad de desactivar neuronas durante entrenamiento (regularización).
+
+**Valor:** 0.3 (30%)
+
+**Aplicación en el modelo:**
+```python
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_dim, dropout=0.3):
+        self.layers = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),  # ← Aquí
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Dropout(dropout)   # ← Y aquí
+        )
+```
+
+**Efecto durante entrenamiento:**
+- En cada forward pass, 30% de las activaciones se ponen a cero aleatoriamente
+- Fuerza al modelo a no depender de neuronas específicas
+- Previene co-adaptación de features
+
+**Justificación:**
+- **Según paper (Tabla 7):** Rangos recomendados [0.0, 0.1, 0.2, 0.3, 0.5]
+- **0.3 es valor moderado:** Balance entre regularización y capacidad de aprendizaje
+- **Dataset-specific:** ETTh1 usa 0.3, ETTm1 usa 0.5 (más regularización)
+
+**Trade-off:**
+```
+dropout=0.0 → Sin regularización → Overfitting potencial     → Alta varianza
+dropout=0.3 → Regularización moderada → Generalización buena → Balanceado
+dropout=0.7 → Regularización fuerte   → Underfitting         → Alto sesgo
+```
+
+---
+
+#### 2.3 Configuración de Entrenamiento
+
+**`batch_size: int = 128`**
+
+**Definición:** Número de muestras procesadas simultáneamente en cada iteración.
+
+**Valor:** 128
+
+**Impacto en entrenamiento:**
+
+**Cálculo de batches por época:**
+```
+Muestras de entrenamiento: 12,003 (para ETTh1, H=96)
+Batches por época: 12,003 / 128 = 93.77 ≈ 94 batches
+```
+
+**Justificación:**
+- **Estabilidad de gradientes:** Batch grande reduce varianza en estimación del gradiente
+- **Eficiencia de GPU:** 128 aprovecha paralelización sin saturar memoria
+- **Según paper:** Usa batch_size=512, pero con más GPUs y datasets más grandes
+
+**Trade-off:**
+```
+batch_size=32  → Gradientes ruidosos → Más exploratorio  → Convergencia lenta → Menos memoria
+batch_size=128 → Balance óptimo      → Estable          → Convergencia buena  → Memoria moderada
+batch_size=512 → Gradientes suaves   → Menos exploración → Convergencia rápida → Mucha memoria
+```
+
+**Consideraciones de memoria:**
+```
+Memory Usage ≈ batch_size × lookback × features × 4 bytes (float32)
+            ≈ 128 × 336 × 7 × 4 = ~1.2 MB (solo input)
+            + activaciones en forward pass (~50 MB)
+            + gradientes (~100 MB)
+Total: ~150 MB por batch (manejable en GPU moderna)
+```
+
+---
+
+**`learning_rate: float = 1e-3`**
+
+**Definición:** Tasa de aprendizaje inicial del optimizador Adam.
+
+**Valor:** 0.001 (1e-3)
+
+**Aplicación:**
+```python
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
+```
+
+**Evolución durante entrenamiento:**
+```
+Época 0:   LR = 1.00e-3
+Época 25:  LR = 5.00e-4  ← Decay coseno
+Época 50:  LR = 1.00e-4
+Época 75:  LR = 2.50e-5
+Época 100: LR = 1.00e-6
+```
+
+**Justificación:**
+- **Tasa estándar para Adam:** 1e-3 es default en la mayoría de implementaciones
+- **Según paper (Tabla 7):** Rangos recomendados [1e-5, 1e-2] en escala logarítmica
+- **Cosine decay:** Reduce LR gradualmente para fine-tuning al final
+
+**Trade-off:**
+```
+LR=1e-2  → Convergencia rápida   → Inestabilidad potencial → Puede diverger
+LR=1e-3  → Convergencia estable  → Balance óptimo          → Buen entrenamiento
+LR=1e-5  → Convergencia muy lenta → Estable pero ineficiente → Puede no converger
+```
+
+**Relación con batch_size:**
+```
+Regla de escalamiento: LR_new = LR_base × (batch_new / batch_base)
+
+Si batch_size=512 (como paper): LR = 1e-3 × (512/128) = 4e-3
+```
+
+---
+
+**`max_epochs: int = 100`**
+
+**Definición:** Número máximo de épocas (pasadas completas sobre datos de entrenamiento).
+
+**Valor:** 100
+
+**Interacción con early stopping:**
+```
+max_epochs=100 → Límite superior
+patience=15    → Detención temprana si no mejora en 15 épocas
+
+Resultado típico: Entrenamiento se detiene en época 50-70
+```
+
+**Justificación:**
+- **Suficiente para convergencia:** La mayoría de experimentos convergen antes de 100 épocas
+- **Previene entrenamiento infinito:** Límite de seguridad si early stopping falla
+- **Eficiencia computacional:** Evita desperdiciar recursos en entrenamiento sin mejora
+
+**Tiempo estimado por época:**
+```
+1 época = 94 batches × ~0.15 seg/batch ≈ 14 segundos
+
+100 épocas × 14 seg = 1400 seg ≈ 23 minutos (sin early stopping)
+70 épocas × 14 seg = 980 seg ≈ 16 minutos (con early stopping típico)
+```
+
+---
+
+**`patience: int = 15`**
+
+**Definición:** Número de épocas sin mejora en validación antes de detener entrenamiento.
+
+**Valor:** 15 épocas
+
+**Lógica de early stopping:**
+```python
+if val_mse < best_val_mse:
+    best_val_mse = val_mse
+    best_epoch = epoch
+    patience_counter = 0  # Reset
+    save_checkpoint()
+else:
+    patience_counter += 1
+    if patience_counter >= patience:
+        print("Early stopping triggered!")
+        break
+```
+
+**Ejemplo de evolución:**
+```
+Época 10: Val MSE=0.523 → Mejor! Guardar checkpoint, counter=0
+Época 11: Val MSE=0.534 → Peor. counter=1
+Época 12: Val MSE=0.521 → Mejor! Guardar checkpoint, counter=0
+Época 13: Val MSE=0.522 → Peor. counter=1
+...
+Época 28: Val MSE=0.530 → Peor. counter=15 → STOP!
+
+Restaurar checkpoint de época 12 (mejor modelo)
+```
+
+**Justificación:**
+- **Previene overfitting:** Detiene antes de que modelo empiece a memorizar datos de entrenamiento
+- **Ahorra tiempo:** Evita épocas innecesarias
+- **Balance exploración/explotación:** 15 es suficiente para escapar de mesetas pero no demasiado paciente
+
+**Trade-off:**
+```
+patience=5  → Detención agresiva  → Puede parar prematuramente → Underfitting potencial
+patience=15 → Balance óptimo      → Permite exploración       → Buen resultado
+patience=50 → Muy paciente        → Riesgo de overfitting     → Tiempo desperdiciado
+```
+
+---
+
+**`grad_clip: float = 1.0`**
+
+**Definición:** Valor máximo de la norma del gradiente (gradient clipping).
+
+**Valor:** 1.0
+
+**Aplicación:**
+```python
+loss.backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # ← Aquí
+optimizer.step()
+```
+
+**Efecto:**
+```
+Gradiente calculado: ||∇L|| = 5.2
+
+Clipping:
+if ||∇L|| > grad_clip:
+    ∇L_clipped = ∇L × (grad_clip / ||∇L||)
+    ∇L_clipped = ∇L × (1.0 / 5.2) = ∇L × 0.192
+
+Resultado: Gradiente escalado para tener norma = 1.0
+```
+
+**Justificación:**
+- **Previene explosión de gradientes:** Común en redes profundas con conexiones residuales
+- **Estabiliza entrenamiento:** Evita updates demasiado grandes que desestabilizan pesos
+- **Valor estándar:** 1.0 es un default común en literatura
+
+**Cuándo se activa:**
+```
+Épocas tempranas (1-10): Frecuentemente (gradientes grandes)
+Épocas medias (10-50): Ocasionalmente
+Épocas finales (50-100): Raramente (convergencia)
+```
+
+**Trade-off:**
+```
+grad_clip=0.1 → Clipping agresivo  → Entrenamiento muy estable → Convergencia lenta
+grad_clip=1.0 → Balance óptimo     → Estabilidad adecuada      → Buen rendimiento
+grad_clip=10  → Clipping permisivo → Permite gradientes grandes → Inestabilidad potencial
+```
+
+---
+
+### Resumen de Impacto de Parámetros
+
+| Parámetro | Afecta a... | Cambio → Impacto |
+|-----------|-------------|------------------|
+| `lookback` | Contexto histórico | ↑ → Más patrones capturados, más memoria |
+| `hidden_dim` | Capacidad del modelo | ↑ → Más expresividad, más parámetros |
+| `num_encoder_layers` | Profundidad encoder | ↑ → Más capacidad, riesgo de overfitting |
+| `num_decoder_layers` | Profundidad decoder | ↑ → Más capacidad, riesgo de overfitting |
+| `dropout` | Regularización | ↑ → Menos overfitting, más sesgo |
+| `batch_size` | Estabilidad de gradientes | ↑ → Más estable, más memoria |
+| `learning_rate` | Velocidad de convergencia | ↑ → Más rápido, menos estable |
+| `max_epochs` | Tiempo de entrenamiento | ↑ → Más tiempo, mejor convergencia |
+| `patience` | Early stopping | ↑ → Más exploratorio, más tiempo |
+| `grad_clip` | Estabilidad numérica | ↓ → Más estable, convergencia lenta |
 
 ### Output de Configuración
 
